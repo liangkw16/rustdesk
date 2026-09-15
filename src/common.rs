@@ -2074,6 +2074,13 @@ async fn secure_tcp_impl(conn: &mut Stream, key: &str, log_on_success: bool) -> 
     if use_ws() {
         return Ok(());
     }
+    key_exchange(conn, key, log_on_success).await.map(|_| ())
+}
+
+/// The server's key exchange on `conn`. `Ok(true)` once the stream is encrypted. `Ok(false)`
+/// when the server sent something else first, nothing parseable, or closed: `secure_tcp`
+/// tolerates that for servers from before the exchange, `secure_tcp_required` does not.
+async fn key_exchange(conn: &mut Stream, key: &str, log_on_success: bool) -> ResultType<bool> {
     let rs_pk = get_rs_pk(key);
     let Some(rs_pk) = rs_pk else {
         bail!("Handshake failed: invalid public key from rendezvous server");
@@ -2102,6 +2109,7 @@ async fn secure_tcp_impl(conn: &mut Stream, key: &str, log_on_success: bool) -> 
                         if log_on_success {
                             log::info!("Connection secured");
                         }
+                        return Ok(true);
                     }
                     _ => {}
                 }
@@ -2109,7 +2117,7 @@ async fn secure_tcp_impl(conn: &mut Stream, key: &str, log_on_success: bool) -> 
         }
         _ => {}
     }
-    Ok(())
+    Ok(false)
 }
 
 pub async fn secure_tcp(conn: &mut Stream, key: &str) -> ResultType<()> {
@@ -2118,6 +2126,31 @@ pub async fn secure_tcp(conn: &mut Stream, key: &str) -> ResultType<()> {
 
 async fn secure_tcp_silent(conn: &mut Stream, key: &str) -> ResultType<()> {
     secure_tcp_impl(conn, key, false).await
+}
+
+/// Like [`secure_tcp`], but returns only once the channel to `host` is actually encrypted: by
+/// the server's key exchange, or by TLS under a `wss://` WebSocket, on which the server runs no
+/// exchange. Anything else is an error, so the caller can withhold what it was about to send
+/// instead of sending it in the clear. `secure_tcp` keeps tolerating a server that does not
+/// answer the exchange, which the paths from before such servers depend on.
+pub async fn secure_tcp_required(conn: &mut Stream, key: &str, host: &str) -> ResultType<()> {
+    if use_ws() {
+        if ws_transport_is_encrypted(host) {
+            return Ok(());
+        }
+        bail!("the WebSocket to the rendezvous server is plain ws://, not encrypted");
+    }
+    if key_exchange(conn, key, true).await? {
+        Ok(())
+    } else {
+        bail!("the rendezvous server did not complete the key exchange");
+    }
+}
+
+/// Whether the WebSocket `connect_tcp` opens to `host` under the current settings runs over
+/// TLS. `check_ws` derives the scheme the same way the connect does.
+pub fn ws_transport_is_encrypted(host: &str) -> bool {
+    hbb_common::websocket::check_ws(host).starts_with("wss://")
 }
 
 #[inline]
@@ -3257,5 +3290,96 @@ mod tests {
         let combined_mask = MOUSE_TYPE_DOWN | ((MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT) << 3);
         assert_eq!(combined_mask & MOUSE_TYPE_MASK, MOUSE_TYPE_DOWN);
         assert_eq!(combined_mask >> 3, MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT);
+    }
+
+    /// A stand-in rendezvous server on loopback: accepts one connection and hands it to `serve`.
+    async fn rendezvous_stub<F, Fut>(serve: F) -> String
+    where
+        F: FnOnce(hbb_common::tcp::FramedStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = hbb_common::tcp::new_listener("127.0.0.1:0", false)
+            .await
+            .unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            if let Ok((stream, addr)) = listener.accept().await {
+                serve(hbb_common::tcp::FramedStream::from(stream, addr)).await;
+            }
+        });
+        host
+    }
+
+    fn server_key() -> (String, sign::SecretKey) {
+        let (pk, sk) = sign::gen_keypair();
+        (encode64(pk.0), sk)
+    }
+
+    async fn connect(host: &str) -> Stream {
+        hbb_common::socket_client::connect_tcp(host.to_owned(), 3000)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_secure_tcp_required_refuses_a_server_without_the_exchange() {
+        let (key, _) = server_key();
+        // A server from before the exchange answers the first message with something else.
+        let serve = |mut s: hbb_common::tcp::FramedStream| async move {
+            let mut msg = RendezvousMessage::new();
+            msg.set_register_peer_response(RegisterPeerResponse::new());
+            s.send(&msg).await.unwrap();
+            sleep(Duration::from_secs(2)).await;
+        };
+        let host = rendezvous_stub(serve).await;
+        let mut conn = connect(&host).await;
+        assert!(secure_tcp_required(&mut conn, &key, &host).await.is_err());
+        assert!(!conn.is_secured());
+        // The legacy call tolerates the same server, and the stream stays in the clear.
+        let host = rendezvous_stub(serve).await;
+        let mut conn = connect(&host).await;
+        secure_tcp(&mut conn, &key).await.unwrap();
+        assert!(!conn.is_secured());
+    }
+
+    #[tokio::test]
+    async fn test_secure_tcp_required_refuses_a_closed_connection() {
+        let (key, _) = server_key();
+        let host = rendezvous_stub(|s| async move { drop(s) }).await;
+        let mut conn = connect(&host).await;
+        assert!(secure_tcp_required(&mut conn, &key, &host).await.is_err());
+        assert!(!conn.is_secured());
+    }
+
+    #[tokio::test]
+    async fn test_secure_tcp_required_accepts_a_completed_exchange() {
+        let (key, sk) = server_key();
+        let host = rendezvous_stub(move |mut s| async move {
+            let (eph_pk, eph_sk) = box_::gen_keypair();
+            let mut msg = RendezvousMessage::new();
+            msg.set_key_exchange(KeyExchange {
+                keys: vec![sign::sign(&eph_pk.0, &sk).into()],
+                ..Default::default()
+            });
+            s.send(&msg).await.unwrap();
+            // The client's reply must decode to a key with the ephemeral secret half.
+            let reply = s.next_timeout(3000).await.unwrap().unwrap();
+            let reply = RendezvousMessage::parse_from_bytes(&reply).unwrap();
+            let Some(rendezvous_message::Union::KeyExchange(ex)) = reply.union else {
+                panic!("expected the client's key exchange");
+            };
+            hbb_common::tcp::Encrypt::decode(&ex.keys[1], &ex.keys[0], &eph_sk).unwrap();
+        })
+        .await;
+        let mut conn = connect(&host).await;
+        secure_tcp_required(&mut conn, &key, &host).await.unwrap();
+        assert!(conn.is_secured());
+    }
+
+    #[test]
+    fn test_ws_transport_is_encrypted_only_for_wss() {
+        assert!(ws_transport_is_encrypted("wss://rs.example/ws/id"));
+        assert!(!ws_transport_is_encrypted("ws://rs.example/ws/id"));
+        assert!(!ws_transport_is_encrypted("ws://203.0.113.5:21118"));
     }
 }
